@@ -36,10 +36,10 @@ def dashboard_stats() -> dict[str, Any]:
                 "SELECT COUNT(*) c FROM watermarks WHERE watermark_ts IS NOT NULL"
             ).fetchone()["c"],
             "dropzone_batches": batch_counts,
-            "dropzone_discovered": discovered + batch_counts.get("invalid", 0),
+            # 发现数就是批次总数；有效 = 待确认 + 已触发，与落盘页/对账口径一致。
+            "dropzone_discovered": discovered,
             "dropzone_valid": batch_counts.get("pending", 0)
-            + batch_counts.get("triggered", 0)
-            - batch_counts.get("ignored", 0),
+            + batch_counts.get("triggered", 0),
         }
     finally:
         conn.close()

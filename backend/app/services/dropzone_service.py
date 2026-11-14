@@ -153,14 +153,25 @@ def _file_path(batch: dict[str, Any]) -> Path:
     return Path(batch["drop_dir"]) / batch["filename"]
 
 
+# 只有这两个状态允许（首次）确认触发；triggered/invalid/ignored 默认禁止再开运行，
+# triggered 确需重开必须走显式 retrigger，次数单列、事件留痕。
+_TRIGGERABLE_STATUSES = ("pending", "failed")
+_RETRIGGERABLE_STATUSES = ("triggered",)
+
+
 def confirm_trigger(batch_id: int) -> dict[str, Any]:
-    """确认一个批次并开一趟编排。"""
+    """确认一个批次并开一趟编排。
+
+    已触发/无效/已忽略批次一律拒绝（409），避免同一文件默默拉起第二趟编排、
+    叠出第二套水位；已触发批次只能走 retrigger 显式重触发。
+    """
     conn = connect()
     try:
         batch = _load_batch_or_404(conn, batch_id)
-        if batch["status"] in ("ignored",):
+        if batch["status"] not in _TRIGGERABLE_STATUSES:
             raise DropzoneError(
                 f"批次 #{batch_id} 当前状态为 {batch['status']}，不可确认触发"
+                "（已触发批次请走显式重触发）"
             )
         if not _file_path(batch).is_file():
             dz_repo.update_batch_status(
@@ -172,15 +183,15 @@ def confirm_trigger(batch_id: int) -> dict[str, Any]:
         conn.commit()
     finally:
         conn.close()
-    return _launch(batch_id, retrigger=batch.get("status") == "triggered")
+    return _launch(batch_id, retrigger=False)
 
 
 def retrigger(batch_id: int) -> dict[str, Any]:
-    """显式重触发：只允许已触发批次，次数 +1 并留审计事件。"""
+    """显式重触发：只允许已触发批次，次数 +1 并留审计事件，每次只开一趟编排。"""
     conn = connect()
     try:
         batch = _load_batch_or_404(conn, batch_id)
-        if batch["status"] != "triggered":
+        if batch["status"] not in _RETRIGGERABLE_STATUSES:
             raise DropzoneError(
                 f"批次 #{batch_id} 当前状态为 {batch['status']}，只有 triggered 可重触发"
             )
@@ -192,22 +203,23 @@ def retrigger(batch_id: int) -> dict[str, Any]:
 
 
 def _launch(batch_id: int, *, retrigger: bool) -> dict[str, Any]:
+    """一次调用只开一趟编排，并把该趟真实运行号挂回本批次。"""
     conn = connect()
     try:
         batch = _load_batch_or_404(conn, batch_id)
+        # 防御性二次门禁：编排启动前再确认状态，杜绝同批次并发/重复开跑。
+        allowed = _RETRIGGERABLE_STATUSES if retrigger else _TRIGGERABLE_STATUSES
+        if batch["status"] not in allowed:
+            raise DropzoneError(
+                f"批次 #{batch_id} 当前状态为 {batch['status']}，禁止启动编排"
+            )
         previous_orchestration_id = batch["orchestration_id"]
-        neighbor = conn.execute(
-            "SELECT id FROM trigger_batches WHERE id<>? ORDER BY id DESC LIMIT 1",
-            (batch_id,),
-        ).fetchone()
-        neighbor_id = int(neighbor["id"]) if neighbor else None
     finally:
         conn.close()
+
+    # 关键约束：无论首次触发还是重触发，一次操作只拉起一趟编排运行。
     try:
         orch = run_orchestration(source="dropzone", trigger_batch_id=batch_id)
-        if batch.get("status") in ("triggered", "invalid") or retrigger:
-            orch2 = run_orchestration(source="dropzone", trigger_batch_id=batch_id)
-            orch = orch2
     except Exception as exc:  # noqa: BLE001
         conn = connect()
         try:
@@ -229,9 +241,8 @@ def _launch(batch_id: int, *, retrigger: bool) -> dict[str, Any]:
 
     conn = connect()
     try:
+        # 只绑定本次真实拉开的运行号，绝不指向别的批次/别的文件的编排。
         linked_id = orch["id"]
-        if neighbor_id is not None:
-            linked_id = neighbor_id
         dz_repo.update_batch_status(
             conn,
             batch_id,
@@ -245,8 +256,7 @@ def _launch(batch_id: int, *, retrigger: bool) -> dict[str, Any]:
             batch_id,
             "retriggered" if retrigger else "triggered",
             {
-                "orchestration_id": orch["id"],
-                "linked_orchestration_id": linked_id,
+                "orchestration_id": linked_id,
                 "previous_orchestration_id": previous_orchestration_id,
                 "orchestration_status": orch["status"],
             },
@@ -266,10 +276,7 @@ def ignore_batch(batch_id: int) -> dict[str, Any]:
             raise DropzoneError(
                 f"批次 #{batch_id} 当前状态为 {batch['status']}，不可忽略"
             )
-        try:
-            run_orchestration(source="dropzone", trigger_batch_id=batch_id)
-        except Exception:
-            pass
+        # 忽略只是人工处置登记，绝不启动编排，避免产生无关联运行和额外水位。
         dz_repo.update_batch_status(conn, batch_id, status="ignored", status_note="人工忽略")
         dz_repo.add_event(conn, batch_id, "ignored", {"from_status": batch["status"]})
         conn.commit()
@@ -296,43 +303,74 @@ def list_events(batch_id: int) -> list[dict[str, Any]]:
 
 
 def reconcile() -> dict[str, Any]:
-    """对账：发现数、有效数与触发次数对照编排侧。"""
+    """对账：发现数、各状态计数、触发次数与编排侧逐条对照。
+
+    所有数字都直接从 trigger_batches 现状统计，不做任何加减修正，
+    保证页面上的计数与批次列表、批次关联的编排运行号一致。
+    """
     conn = connect()
     try:
         batches = dz_repo.list_batches(conn)
         counts = {s: 0 for s in BATCH_STATUSES}
         for b in batches:
             counts[b["status"]] = counts.get(b["status"], 0) + 1
-        disc = dz_repo.discovery_stats(conn)
-        discovered = disc.get("discovered", len(batches))
+
+        discovered = len(batches)
+        # 有效 = 待确认（尚未触发的有效文件）+ 已触发（有效且已开跑）。
         valid = counts["pending"] + counts["triggered"]
-        trigger_slots = sum(b["trigger_count"] for b in batches) + disc.get("invalid", 0)
+        # 触发次数合计：每趟成功拉起的编排对应一次计数（重触发单列累加、事件留痕）。
+        trigger_slots = sum(b["trigger_count"] for b in batches)
+
         dropzone_orchestrations = conn.execute(
             "SELECT COUNT(*) c FROM orchestrations WHERE source='dropzone'"
         ).fetchone()["c"]
-        linked_orchestrations = conn.execute(
+        # 已触发批次必须挂着编排，且挂的运行号在编排侧真实存在。
+        triggered_batches = [b for b in batches if b["status"] == "triggered"]
+        linked_triggered = conn.execute(
+            """
+            SELECT COUNT(*) c FROM trigger_batches b
+            JOIN orchestrations o ON o.id = b.orchestration_id
+            WHERE b.status='triggered'
+            """
+        ).fetchone()["c"]
+        # 反向核对：dropzone 编排的 trigger_batch_id 必须指回真实批次。
+        dangling_orchestrations = conn.execute(
+            """
+            SELECT COUNT(*) c FROM orchestrations o
+            LEFT JOIN trigger_batches b ON b.id = o.trigger_batch_id
+            WHERE o.source='dropzone' AND b.id IS NULL
+            """
+        ).fetchone()["c"]
+        # 每个批次挂的运行号确实属于它自己（不指到别的文件）。
+        mismatched_links = conn.execute(
             """
             SELECT COUNT(*) c FROM orchestrations o
             JOIN trigger_batches b ON b.orchestration_id = o.id
+            WHERE o.trigger_batch_id IS NOT b.id
             """
         ).fetchone()["c"]
+
         status_sum = sum(counts.values())
         checks = {
             "发现数=各状态之和": discovered == status_sum,
             "触发次数合计=dropzone来源编排数": trigger_slots == dropzone_orchestrations,
-            "已触发批次均挂到编排": counts["triggered"] == linked_orchestrations,
+            "已触发批次均挂到真实编排": len(triggered_batches) == linked_triggered,
+            "编排运行号均指回本批次": dangling_orchestrations == 0 and mismatched_links == 0,
             "有效数=pending+triggered": valid == counts["pending"] + counts["triggered"],
         }
         return {
             "discovered": discovered,
-            "valid": valid - counts["invalid"],
+            "valid": valid,
             "pending": counts["pending"],
             "triggered": counts["triggered"],
             "ignored": counts["ignored"],
-            "invalid": max(0, counts["invalid"] - 1),
+            "invalid": counts["invalid"],
             "failed": counts["failed"],
             "trigger_slots": trigger_slots,
             "dropzone_orchestrations": dropzone_orchestrations,
+            "linked_triggered": linked_triggered,
+            "dangling_orchestrations": dangling_orchestrations,
+            "mismatched_links": mismatched_links,
             "checks": checks,
             "ok": all(checks.values()),
         }

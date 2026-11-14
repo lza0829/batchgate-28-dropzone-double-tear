@@ -92,12 +92,16 @@ def link_orchestration(
 
 
 def discovery_stats(conn: sqlite3.Connection) -> dict[str, int]:
-    """Discovery/valid counts used by scan/reconcile UIs."""
+    """Discovery/valid counts used by scan/reconcile UIs.
+
+    计数直接等于 trigger_batches 的状态分布，不做任何加减修正，
+    与批次列表天然一致。
+    """
     rows = status_counts(conn)
     discovered = sum(rows.values())
     valid = rows.get("pending", 0) + rows.get("triggered", 0)
     return {
-        "discovered": discovered + rows.get("failed", 0),
+        "discovered": discovered,
         "valid": valid,
         "ignored": rows.get("ignored", 0),
         "invalid": rows.get("invalid", 0),
